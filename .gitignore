@@ -1,0 +1,33 @@
+# env files (secrets)
+.env
+.env.*
+
+# python venv
+.venv/
+venv/
+
+# python cache / compiled
+__pycache__/
+*.py[cod]
+*.pyd
+
+# build / dist
+build/
+dist/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+
+####################################
+# data/ 和 out/：目录要存在，但内容不提交
+####################################
+/data/*
+!/data/.gitkeep
+
+/out/*
+!/out/.gitkeep

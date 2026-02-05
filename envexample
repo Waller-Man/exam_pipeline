@@ -1,0 +1,4 @@
+ARK_API_KEY=
+ARK_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
+ARK_VISION_MODEL=doubao-seed-1-6-251015
+ARK_TEXT_MODEL=doubao-seed-1-6-251015
