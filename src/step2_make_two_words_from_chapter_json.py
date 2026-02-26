@@ -4,7 +4,7 @@ import math
 import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
+import time
 from dotenv import load_dotenv
 from tqdm import tqdm
 from volcenginesdkarkruntime import Ark
@@ -114,9 +114,9 @@ def build_rewrite_prompt(kp_text: str, q: Dict[str, Any]) -> str:
 1) {type_hint}。
 2) 不允许与原题高度相似：不要复用原题完整句子；情境/表述/数据应有变化（可以参考结构与数据范围）。
 3）题型必须与原题一致，原题为选择题，改编题为选择题，原题为简答题，改变的题目为简答题。
-4) 这题不含图（若你发现原题含图请仍按原题格式改写，但不要加入图片内容；不过我们系统只会对无图题调用你）。
+4）如果改编的题目有材料，例如英语的阅读题或材料题，你的改编需要包含这些材料，并输出新题。
 5) 输出必须包含：改编后的“题干+选项(如有)”，以及“答案”和“解析”（解析要说明为什么选该答案）。
-6) 不要输出答案以外的多余内容，不要输出 markdown。
+6) 不要输出答案以外的多余内容，不要输出 markdown,解析不允许输出全英文。
 
 JSON 结构（必须完全一致）：
 {{
@@ -134,13 +134,42 @@ JSON 结构（必须完全一致）：
 """.strip()
 
 
-def ark_chat_json(client: Ark, prompt: str, temperature: float = 0.4) -> dict:
-    resp = client.chat.completions.create(
-        model=TEXT_MODEL,
-        temperature=temperature,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    return safe_json_loads(resp.choices[0].message.content)
+def ark_chat_json(
+    client: Ark,
+    prompt: str,
+    temperature: float = 0.4,
+    max_retries: int = 3,
+    stage: str = "model_call",
+) -> dict:
+    last_err: Exception | None = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=TEXT_MODEL,
+                temperature=temperature,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},  # ✅ 强制输出 JSON
+            )
+            content = resp.choices[0].message.content
+            return safe_json_loads(content)
+
+        except Exception as e:
+            last_err = e
+            # 打印当前阶段+重试次数，方便定位
+            msg = str(e)
+            if attempt < max_retries:
+                wait = 1.5 * attempt
+                print(f"[警告] {stage} 第{attempt}次返回非JSON/解析失败，{wait:.1f}s后重试：{msg}", flush=True)
+                time.sleep(wait)
+                continue
+
+            # 最后一次也失败：抛给外层决定“跳题”
+            raise RuntimeError(f"{stage} 连续{max_retries}次失败：{msg}") from e
+
+    # 理论上不会走到这里
+    raise RuntimeError(f"{stage} failed") from last_err
+
 
 
 def choose_rewrite_targets(questions_flat: List[Dict[str, Any]], ratio: float, seed: int) -> List[Dict[str, Any]]:
@@ -290,7 +319,17 @@ def main(chapter_name: str, ratio: float = 0.3, seed: int = 2026):
             uid = q.get("uid")
             print(f"[阶段] 4/6 进度 {i}/{len(targets)}：{uid}", flush=True)
             prompt = build_rewrite_prompt(kp["kp_text"], q)
-            out = ark_chat_json(client, prompt, temperature=0.5)
+            try:
+                out = ark_chat_json(
+                    client,
+                    prompt,
+                    temperature=0.5,
+                    max_retries=3,            # 你想重试几次就写几次
+                    stage=f"改编题 {uid}",     # 日志里能看见是哪道题
+                )
+            except Exception as e:
+                print(f"[跳过] {uid} 改编失败：{e}", flush=True)
+                continue
 
             rewrites.append({
                 **out,
@@ -300,6 +339,7 @@ def main(chapter_name: str, ratio: float = 0.3, seed: int = 2026):
                 "source_uid": q.get("uid"),
                 "source_raw_text": q.get("raw_text"),
             })
+
     else:
         print("[阶段] 4/6 无可改编题（可能全是含图题，或ratio=0）", flush=True)
 

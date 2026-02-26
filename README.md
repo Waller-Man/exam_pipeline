@@ -158,3 +158,6 @@ python src\step2_make_two_words_from_chapter_json.py ch01 0.3 2026
 
 个人学习与研究用途。
 
+pandoc "h21_原文整理版.md" -f "markdown+tex_math_dollars+tex_math_double_backslash" -t docx -o "h21_原文整理版.docx"
+pandoc "h21_核心知识点与改编题.md" -f "markdown+tex_math_dollars+tex_math_double_backslash" -t docx -o "h21_核心知识点与改编题.docx"
+python src\step2_make_two_markdowns.py h11 --ratio 0.4 --seed 42

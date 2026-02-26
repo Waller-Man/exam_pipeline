@@ -84,22 +84,42 @@ def build_prompt_sections() -> str:
     """
     return (
         "你是一名“试题图片转文本”助手。该图片是一页试卷/练习题扫描页，可能包含多个大题/题型，"
-        "且每个大题内部小题题号可能从1重新开始。请按“大题 -> 小题”的层级结构输出。\n"
+        "且每个大题内部小题题号可能从1重新开始。请按“大题 -> 题目”的层级结构输出。\n"
         "必须只输出 JSON（不要输出解释、不要 markdown、不要多余字符）。\n\n"
+
+        "【关键一致性规则（必须严格遵守）】\n"
+        "A) 对于“材料题/英语阅读理解/完形填空/语篇填空/阅读材料题/篇章类题目”：\n"
+        "   - 只要该页出现一段较长的文章/材料/对话/说明文字，并且后面跟着多个小题（通常题号连续），\n"
+        "     你必须把“文章/材料 + 后续所有相关小题”合并成 questions 数组里的【一个】对象（当作一道大题题目）。\n"
+        "   - 严禁把文章本身当作一条小题；也严禁把同一篇文章拆成多条 question。\n"
+        "   - 合并后的 raw_text 必须包含完整结构：\n"
+        "     【材料/原文】\\n(文章全文)\\n\\n【小题1】\\n(题干+选项)\\n\\n【小题2】... 直到该材料对应的小题结束。\n"
+        "   - 合并后的 question_number：填该材料题组的“起始小题号”。若材料对应 11~15，则 question_number=11。\n"
+        "   - 如果你能明确材料对应的小题范围（例如“回答11-15题”“Questions 11-15”），请在 raw_text 开头额外加一行：\n"
+        "     【题组范围】11-15\n"
+        "B) 对于非材料题：仍按“一小题一个 question”输出。\n\n"
+        "C)  若涉及数学/化学/物理表达式、化学式、上下标、分式等：请使用 LaTeX，并用 $...$ 包裹。如果在 JSON 字符串中输出 LaTeX 命令（以反斜杠开头），必须使用双反斜杠 \\ 表示一个反斜杠。\n\n"
+
         "识别要求：\n"
         "1) 将页面按大题/题型分组输出到 sections 数组。若同一页出现多个大题（如“一、… 二、…”），必须拆分为多个 section。\n"
-        "2) 每个 section：\n"
+        "2) section 字段：\n"
         "   - section_index：大题编号（从“一、二、三/第1部分/第2部分”等识别；能确认填整数，否则填 null）\n"
-        "   - section_title：大题标题或题型名称（如“单项选择题/填空题/判断题/简答题”等；无法确认填 null）\n"
-        "   - questions：该大题内的小题数组，按小题题号升序排列\n"
-        "3) 每道小题字段：\n"
-        "   - question_number：小题题号（整数；无法确认填 null 并在 errors 加入 \"MISSING_QNO\"）\n"
-        "   - raw_text：该题完整题干+选项，尽量保留换行与数学符号\n"
-        "   - has_figure：该题是否含图/表/坐标图等非纯文字内容\n"
+        "   - section_title：大题标题或题型名称（如“单项选择题/填空题/判断题/简答题/阅读理解/完形填空/语篇填空”等；无法确认填 null）\n"
+        "   - questions：该大题内的题目数组。\n"
+        "3) question 字段：\n"
+        "   - question_number：\n"
+        "       * 普通题：小题题号（整数；无法确认填 null 并在 errors 加入 \"MISSING_QNO\"）\n"
+        "       * 材料题组：填该题组“第一道小题号”（例如 11-15 填 11）。\n"
+        "   - raw_text：题干+选项，尽量保留换行与符号。材料题组必须按【材料/原文】与【小题x】格式输出。\n"
+        "   - has_figure：该题是否含图/表/坐标图等非纯文字内容（材料题组中任一小题含图则为 true）\n"
         "   - figure_note：若 has_figure=true，用一句话描述图类型/关键元素；否则 null\n"
-        "   - errors：数组\n"
+        "   - errors：数组（可包含：\"MISSING_QNO\"、\"TRUNCATED\"、\"MATERIAL_GROUP_UNCERTAIN\" 等）\n"
         "   - confidence：0~1\n"
-        "4) 如果该页明显包含多个大题但你无法可靠分割，请在顶层 errors 中加入 \"SPLIT_UNCERTAIN\"。\n\n"
+        "4) 排序：普通题按 question_number 升序；材料题组按其首题号排序。\n"
+        "5) 如果你判断存在材料题组，但无法确定哪些小题属于同一材料，请仍然合并为一个 question，\n"
+        "   并在该 question 的 errors 中加入 \"MATERIAL_GROUP_UNCERTAIN\"。\n"
+        "6) 如果该页明显包含多个大题但你无法可靠分割，请在顶层 errors 中加入 \"SPLIT_UNCERTAIN\"。\n\n"
+
         "JSON 结构（必须完全一致）：\n"
         "{\n"
         '  "sections": [\n'
@@ -122,6 +142,7 @@ def build_prompt_sections() -> str:
         '  "confidence": 0.0\n'
         "}\n"
     )
+
 
 
 def call_vision_page(client: Ark, img_path: Path, max_retries: int = 3) -> dict:
@@ -155,6 +176,105 @@ def call_vision_page(client: Ark, img_path: Path, max_retries: int = 3) -> dict:
 
 
 # ---------- 合并与输出 ----------
+def normalize_page_schema(page: Any) -> dict:
+    """
+    把模型输出强行归一化为：
+    {
+      "sections": [ { "section_index": int|null, "section_title": str|null, "questions":[{...}] } ],
+      "errors": [...],
+      "confidence": float
+    }
+    并尽量把“字符串形式的 section / question”兜底成对象，避免后续 .get() 崩溃。
+    """
+    if not isinstance(page, dict):
+        return {"sections": [], "errors": ["BAD_SCHEMA"], "confidence": 0.0}
+
+    errors = page.get("errors") or []
+    if not isinstance(errors, list):
+        errors = ["BAD_SCHEMA_ERRORS"]
+
+    sections = page.get("sections", [])
+    if isinstance(sections, dict):
+        sections = [sections]
+    elif isinstance(sections, str):
+        sections = [{"section_index": None, "section_title": sections, "questions": []}]
+        errors.append("SECTION_WAS_STRING")
+    elif not isinstance(sections, list):
+        sections = []
+        errors.append("BAD_SCHEMA_SECTIONS")
+
+    norm_sections: List[dict] = []
+
+    for sec in sections:
+        if isinstance(sec, str):
+            sec = {"section_index": None, "section_title": sec, "questions": []}
+            errors.append("SECTION_WAS_STRING")
+
+        if not isinstance(sec, dict):
+            errors.append("SECTION_BAD_TYPE")
+            continue
+
+        sec.setdefault("section_index", None)
+        sec.setdefault("section_title", None)
+
+        qs = sec.get("questions", [])
+        if isinstance(qs, dict):
+            qs = [qs]
+        elif isinstance(qs, str):
+            # 极端兜底：把整段当成一个“未知题号”的题
+            qs = [{
+                "question_number": None,
+                "raw_text": qs,
+                "has_figure": False,
+                "figure_note": None,
+                "errors": ["Q_WAS_STRING"],
+                "confidence": 0.0,
+            }]
+            errors.append("QUESTIONS_WAS_STRING")
+        elif not isinstance(qs, list):
+            qs = []
+            errors.append("BAD_SCHEMA_QUESTIONS")
+
+        norm_qs: List[dict] = []
+        for q in qs:
+            if isinstance(q, str):
+                q = {
+                    "question_number": None,
+                    "raw_text": q,
+                    "has_figure": False,
+                    "figure_note": None,
+                    "errors": ["Q_WAS_STRING"],
+                    "confidence": 0.0,
+                }
+                errors.append("Q_WAS_STRING")
+
+            if not isinstance(q, dict):
+                errors.append("Q_BAD_TYPE")
+                continue
+
+            q.setdefault("question_number", None)
+            q.setdefault("raw_text", "")
+            q.setdefault("has_figure", False)
+            q.setdefault("figure_note", None)
+            q.setdefault("errors", [])
+            q.setdefault("confidence", None)
+
+            if not isinstance(q["errors"], list):
+                q["errors"] = ["BAD_Q_ERRORS"]
+
+            norm_qs.append(q)
+
+        sec["questions"] = norm_qs
+        norm_sections.append(sec)
+
+    page["sections"] = norm_sections
+    page["errors"] = list(dict.fromkeys(errors))
+
+    conf = page.get("confidence", 0.0)
+    if not isinstance(conf, (int, float)):
+        page["confidence"] = 0.0
+
+    return page
 
 def infer_section_if_missing(
     page: dict,
@@ -298,7 +418,9 @@ def main(chapter_dir: str):
 
         print(f"[阶段] 2/5 识别第{idx}页（page_no={page_no}，文件={img.name}）...", flush=True)
         page = call_vision_page(client, img)
-
+        
+        # ✅ 新增：先归一化，防止 sections 里混入 str 导致 .get() 崩溃
+        page = normalize_page_schema(page)
         # 挂上元信息
         page["_meta"] = {
             "page_no": page_no,
