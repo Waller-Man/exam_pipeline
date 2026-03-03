@@ -168,8 +168,11 @@ python src\step2_make_two_markdowns.py ch01 --ratio 1 --seed 42 --workers 15 --r
   一般是模型输出被截断或 JSON 不规范。docx 版 step1 已内置自动修复与自动二分重试；如仍失败可查看 `out/<chapter>/_debug/` 的原始回复。
 
 * 转出的markdown建议用 pandoc转成 word
+```bash
   pandoc "物理7_原文整理版.md" -f "markdown+tex_math_dollars+tex_math_double_backslash" -t docx -o "物理7_原文整理版.docx"
   pandoc "物理7_核心知识点与改编题.md" -f "markdown+tex_math_dollars+tex_math_double_backslash" -t docx -o "物理7_核心知识点与改编题.docx"
+```
+
 ---
 ## 运行截图
 
