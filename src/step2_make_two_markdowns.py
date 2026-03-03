@@ -7,7 +7,7 @@ import math
 import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 from tqdm import tqdm
 from volcenginesdkarkruntime import Ark
@@ -135,6 +135,7 @@ def clean_md_text(s: str) -> str:
     if s is None:
         return ""
     s = recover_latex_from_json_escapes(s)
+    s = re.sub(r"\\\\(?=[A-Za-z])", r"\\", s)
     s = s.replace("\r\n", "\n").replace("\r", "\n")
     # 去掉除了 \n 之外的大多数控制字符（0x00-0x1F）
     cleaned = []
@@ -235,23 +236,40 @@ JSON 结构（必须完全一致）：
 """.strip()
 
 
-def build_rewrite_prompt(uid: str, kp_text: str, raw: str, fig_note: Optional[str]) -> str:
+def build_rewrite_prompt(
+    uid: str,
+    kp_text: str,
+    raw: str,
+    fig_note: Optional[str],
+    allow_figure_rewrite: bool = False,
+) -> str:
     """
     改编题：保持题型风格（例如选择题仍要 A/B/C/D），不输出图片内容。
     输出要包含答案与解析；解析尽量中文。
     """
     fig_tip = ""
     if fig_note:
-        fig_tip = f"\n注意：原题含图，图备注：{fig_note}\n本题不允许改编，请直接返回 JSON，rewritten_text/answer/explanation 全部置空字符串。\n"
+        if not allow_figure_rewrite:
+            fig_tip = (
+                f"\n注意：原题含图，图备注：{fig_note}\n"
+                "本题不允许改编，请直接返回 JSON，rewritten_text/answer/explanation 全部置空字符串。\n"
+            )
+        else:
+            fig_tip = (
+                f"\n注意：原题含图，图备注：{fig_note}\n"
+                "你可以改编本题，但改编题必须完全用文字给出必要条件与数据，不能依赖图片本身；不得输出图片或“如图所示”等指代。\n"
+            )
 
-    return f"""
+    return rf"""
 你将收到一道原题（识别稿）以及本章核心知识点笔记。
 请基于知识点对该题进行改编（保持题型一致；若为单项选择题必须有 A/B/C/D 四个选项）。
 改编后的题目要“风格相近但不能与原题相同”，可以参考原题的设问方式与数据规模，但不要照抄。
 
 非常重要：
-- 改编题中如出现数学/化学/物理公式，请用 LaTeX 且用 $...$ 包裹（行内即可）。
-- 只输出 JSON（不要输出解释、不要 markdown、不要任何多余字符）。
+- 改编题中如出现数学/化学/物理公式，请用原生的 LaTeX 且用 $...$ 包裹（行内即可）。
+- 所有数学公式只允许用 $...$ 或 $$...$$。
+- 在数学公式内，所有 LaTeX 控制序列一律使用单个反斜杠（例如 \geq \leq \frac \sqrt），禁止输出 \\geq、\\leq、\\frac 这种双反斜杠形式。
+- 只有在 \begin{{aligned}} / \begin{{array}} 等对齐环境里需要换行时，才允许使用 \\ 作为“换行”，且 \\ 后必须跟空格或换行，而不是字母。
 {fig_tip}
 
 输出 JSON 结构（必须完全一致）：
@@ -269,14 +287,68 @@ def build_rewrite_prompt(uid: str, kp_text: str, raw: str, fig_note: Optional[st
 {raw}
 """.strip()
 
+def _rewrite_one(
+    index: int,
+    q: Dict[str, Any],
+    kp_text: str,
+    rewrite_figures: bool = False,
+) -> Tuple[int, Optional[dict]]:
+    """
+    并发 worker：每题独立 client，避免共享 Ark client 的线程安全/状态问题。
+    返回 (index, item_or_none)；失败返回 None（保持原逻辑：失败就跳过）。
+    """
+    uid = q.get("uid")
+    raw = clean_md_text(q.get("raw_text", ""))
+    fig_note = q.get("figure_note") if q.get("has_figure", False) else None
 
+    prompt = build_rewrite_prompt(
+        uid=uid,
+        kp_text=kp_text,
+        raw=raw,
+        fig_note=fig_note,
+        allow_figure_rewrite=rewrite_figures,
+    )
+
+    try:
+        # 每个线程创建自己的 client（更稳）
+        client = Ark(base_url=BASE_URL, api_key=API_KEY)
+        out = ark_chat_json(client, prompt, temperature=0.5, max_retries=3, stage=f"rewrite:{uid}")
+
+        item = {
+            "uid": out.get("uid", uid),
+            "rewritten_text": clean_md_text(out.get("rewritten_text", "")),
+            "answer": clean_md_text(out.get("answer", "")),
+            "explanation": clean_md_text(out.get("explanation", "")),
+
+            # 映射信息（便于校验）
+            "source_uid": uid,
+            "source_section_index": q.get("section_index"),
+            "source_section_title": q.get("section_title"),
+            "source_question_number": q.get("question_number"),
+            "source_raw_text": clean_md_text(q.get("raw_text", "")),
+        }
+        return index, item
+    except Exception as e:
+        print(f"[跳过] {uid} 改编失败：{e}", flush=True)
+        return index, None
+    
 # ---------------------------
 # 抽样改编目标
 # ---------------------------
-def choose_rewrite_targets(questions_flat: List[Dict[str, Any]], ratio: float, seed: int) -> List[Dict[str, Any]]:
+def choose_rewrite_targets(
+    questions_flat: List[Dict[str, Any]],
+    ratio: float,
+    seed: int,
+    include_figures: bool = False,
+) -> List[Dict[str, Any]]:
     eligible = [
         q for q in questions_flat
-        if (q.get("uid") and (q.get("raw_text") or "").strip() and (not q.get("has_figure", False)))
+        #if (q.get("uid") and (q.get("raw_text") or "").strip() and (not q.get("has_figure", False)))
+        if (
+            q.get("uid")
+            and (q.get("raw_text") or "").strip()
+            and (include_figures or (not q.get("has_figure", False)))
+        )
     ]
     n = len(eligible)
     if n == 0:
@@ -374,7 +446,13 @@ def export_md_kp_and_rewrites(chapter_name: str, kp: dict, rewrites: List[dict],
 # ---------------------------
 # 主流程
 # ---------------------------
-def main(chapter: str, ratio: float = 0.3, seed: int = 42) -> None:
+def main(
+    chapter: str,
+    ratio: float = 0.3,
+    seed: int = 42,
+    workers: int = 15,
+    rewrite_figures: bool = False,
+) -> None:
     chapter_name = chapter
     out_dir = Path("out") / chapter_name
     in_json_path = out_dir / f"{chapter_name}.json"
@@ -428,37 +506,27 @@ def main(chapter: str, ratio: float = 0.3, seed: int = 42) -> None:
     kp["kp_text"] = clean_md_text(kp.get("kp_text", ""))
 
     print("[阶段] 3/4 随机抽题并逐题改编（JSON）...", flush=True)
-    targets = choose_rewrite_targets(questions_flat, ratio=ratio, seed=seed)
+    targets = choose_rewrite_targets(questions_flat, ratio=ratio, seed=seed, include_figures=rewrite_figures)
     rewrites: List[dict] = []
 
-    for q in tqdm(targets, desc="改编中", ncols=80):
-        uid = q.get("uid")
-        raw = clean_md_text(q.get("raw_text", ""))
-        fig_note = q.get("figure_note") if q.get("has_figure", False) else None
+    max_workers = min(int(workers), len(targets)) if targets else 0
+    if max_workers <= 0:
+        rewrites = []
+    else:
+        results: List[Optional[dict]] = [None] * len(targets)
 
-        prompt = build_rewrite_prompt(uid=uid, kp_text=kp["kp_text"], raw=raw, fig_note=fig_note)
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [
+                ex.submit(_rewrite_one, i, q, kp["kp_text"], rewrite_figures)
+                for i, q in enumerate(targets)
+            ]
 
-        try:
-            out = ark_chat_json(client, prompt, temperature=0.5, max_retries=3, stage=f"rewrite:{uid}")
-        except Exception as e:
-            # 连续失败：跳过该题
-            print(f"[跳过] {uid} 改编失败：{e}", flush=True)
-            continue
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="改编中(并发)", ncols=80):
+                idx, item = fut.result()
+                results[idx] = item
 
-        item = {
-            "uid": out.get("uid", uid),
-            "rewritten_text": clean_md_text(out.get("rewritten_text", "")),
-            "answer": clean_md_text(out.get("answer", "")),
-            "explanation": clean_md_text(out.get("explanation", "")),
-
-            # 映射信息（便于校验）
-            "source_uid": uid,
-            "source_section_index": q.get("section_index"),
-            "source_section_title": q.get("section_title"),
-            "source_question_number": q.get("question_number"),
-            "source_raw_text": clean_md_text(q.get("raw_text", "")),
-        }
-        rewrites.append(item)
+        # 保持与原 targets 顺序一致（方便复现/对齐）
+        rewrites = [x for x in results if x is not None]
 
     print("[阶段] 4/4 生成“核心知识点+改编题.md”...", flush=True)
     md_new_path = out_dir / f"{chapter_name}_核心知识点与改编题.md"
@@ -478,6 +546,18 @@ if __name__ == "__main__":
     parser.add_argument("chapter", help="章节名，例如 ch01")
     parser.add_argument("--ratio", type=float, default=0.3, help="改编比例（0~1）")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    parser.add_argument("--workers", type=int, default=15, help="并发改编数（默认 15）")
+    parser.add_argument(
+    "--rewrite_figures",
+    action="store_true",
+    help="允许改编含图题（改编题需完全文字自洽，不依赖图片）",
+)
     args = parser.parse_args()
 
-    main(args.chapter, ratio=args.ratio, seed=args.seed)
+    main(
+    args.chapter,
+    ratio=args.ratio,
+    seed=args.seed,
+    workers=args.workers,
+    rewrite_figures=args.rewrite_figures,
+)

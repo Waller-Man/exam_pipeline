@@ -104,9 +104,9 @@ python src\step1_docx_build_chapter_json.py ch01 "data\docs\chapter1.docx"
 如果你的章节是图片（扫描页），请先把图片放到章节文件夹（例如 `data\ch01\`），然后使用你现有的识图脚本生成章节 JSON（不同项目实现命令可能不同，下方给出常见形式）：
 
 ```bash
-python src\step1_build_chapter_json.py
+python src\step1_build_chapter_json.py "data\ch01" --workers 5 
 ```
-
+其中 workers 为并发请求的数量 豆包API建议低于50
 目标输出同样是：
 
 * `out\ch01\ch01.json`
@@ -133,6 +133,31 @@ python src\step2_make_two_words_from_chapter_json.py ch01 0.3 2026
 * `out\ch01\ch01_核心知识点与改编题.docx`
 
 ---
+---
+
+### D. Step2（章节 JSON -> 两份 markdown）
+
+当 `out\ch01\ch01.json` 已存在后，运行 step2：
+
+```bash
+python src\step2_make_two_markdowns.py ch01 --ratio 1 --seed 42 --workers 15 --rewrite_figures
+```
+
+参数说明：
+
+* `ch01`：章节名（必须与 `out/<chapter>/<chapter>.json` 对应）
+* `0.3`：抽题改编比例（例如 0.3 表示 30%）
+* `2026`：随机种子（改变它会抽到不同题）
+* `workers`：并发请求数，豆包API建议低于50
+* `--rewrite_figures`：是否支持带图片的题目改编
+
+
+输出文件：
+
+* `out\ch01\ch01_原文整理版.md`
+* `out\ch01\ch01_核心知识点与改编题.md`
+
+---
 
 ## 常见问题
 
@@ -142,6 +167,9 @@ python src\step2_make_two_words_from_chapter_json.py ch01 0.3 2026
 * Step1 报 JSON 解析错误
   一般是模型输出被截断或 JSON 不规范。docx 版 step1 已内置自动修复与自动二分重试；如仍失败可查看 `out/<chapter>/_debug/` 的原始回复。
 
+* 转出的markdown建议用 pandoc转成 word
+  pandoc "物理7_原文整理版.md" -f "markdown+tex_math_dollars+tex_math_double_backslash" -t docx -o "物理7_原文整理版.docx"
+  pandoc "物理7_核心知识点与改编题.md" -f "markdown+tex_math_dollars+tex_math_double_backslash" -t docx -o "物理7_核心知识点与改编题.docx"
 ---
 ## 运行截图
 
@@ -150,14 +178,17 @@ python src\step2_make_two_words_from_chapter_json.py ch01 0.3 2026
 ---
 ## 未来优化计划
 
-- **并发化流水线**：将识图、抽取与改编等环节改为并发/异步执行，降低总体运行耗时。  
-- **支持含图题目改编**：在现有纯文本改编的基础上，扩展为支持“题干/选项包含图片”的题目抽取与改编（当前版本仅支持纯文本题目改编）。
+## 未来优化计划
+
+- [x] **并发化流水线**：将识图、抽取与改编等环节改为并发/异步执行，降低总体运行耗时。  
+- [x] **支持含图题目改编**：在现有纯文本改编的基础上，扩展为支持“题干/选项包含图片”的题目抽取与改编（当前版本仅支持纯文本题目改编）。  
+- [ ] **模块化设计与 GUI 支持**：后续采用模块化设计，拆分核心能力为独立模块，并提供 GUI 界面以便交互式配置与一键运行。  
 
 ---
 ## License
 
 个人学习与研究用途。
 
-pandoc "h21_原文整理版.md" -f "markdown+tex_math_dollars+tex_math_double_backslash" -t docx -o "h21_原文整理版.docx"
-pandoc "h21_核心知识点与改编题.md" -f "markdown+tex_math_dollars+tex_math_double_backslash" -t docx -o "h21_核心知识点与改编题.docx"
-python src\step2_make_two_markdowns.py h11 --ratio 0.4 --seed 42
+
+
+

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import os
 import re
 import json
@@ -6,6 +7,7 @@ import base64
 from pathlib import Path
 from datetime import datetime
 from typing import Any, Dict, List, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 from tqdm import tqdm
@@ -22,6 +24,7 @@ VISION_MODEL = os.getenv("ARK_VISION_MODEL")
 
 def safe_json_loads(s: str) -> dict:
     """兜底解析：允许 JSON 前后混入少量文字，截取最外层 {} 再 loads。"""
+    s = (s or "").strip()
     try:
         return json.loads(s)
     except json.JSONDecodeError:
@@ -56,7 +59,6 @@ def extract_page_no_from_name(name: str) -> int:
     if not re.fullmatch(r"\d+", stem):
         raise ValueError(f"页码格式错误：{name}（要求文件名必须为纯数字页码，如 001.jpg）")
     return int(stem)
-
 
 
 def list_images_sorted(chapter_path: Path) -> List[Path]:
@@ -98,7 +100,7 @@ def build_prompt_sections() -> str:
         "   - 如果你能明确材料对应的小题范围（例如“回答11-15题”“Questions 11-15”），请在 raw_text 开头额外加一行：\n"
         "     【题组范围】11-15\n"
         "B) 对于非材料题：仍按“一小题一个 question”输出。\n\n"
-        "C)  若涉及数学/化学/物理表达式、化学式、上下标、分式等：请使用 LaTeX，并用 $...$ 包裹。如果在 JSON 字符串中输出 LaTeX 命令（以反斜杠开头），必须使用双反斜杠 \\ 表示一个反斜杠。\n\n"
+        "C) 所有数学公式只允许用 $...$ 或 $$...$$。在数学公式内，所有 LaTeX 控制序列一律使用单个反斜杠（例如 \geq \leq \frac \sqrt），禁止输出 \\geq、\\leq、\\frac 这种双反斜杠形式。只有在 \begin{aligned} / \begin{array} 等对齐环境里需要换行时，才允许使用 \\ 作为“换行”，且 \\ 后必须跟空格或换行，而不是字母。"
 
         "识别要求：\n"
         "1) 将页面按大题/题型分组输出到 sections 数组。若同一页出现多个大题（如“一、… 二、…”），必须拆分为多个 section。\n"
@@ -144,7 +146,6 @@ def build_prompt_sections() -> str:
     )
 
 
-
 def call_vision_page(client: Ark, img_path: Path, max_retries: int = 3) -> dict:
     prompt = build_prompt_sections()
     data_url = image_to_data_url(img_path)
@@ -165,20 +166,20 @@ def call_vision_page(client: Ark, img_path: Path, max_retries: int = 3) -> dict:
             )
             return safe_json_loads(resp.choices[0].message.content)
         except Exception as e:
-            # 简单重试：429/短暂网络抖动时很常见
             msg = str(e)
             if attempt < max_retries:
                 wait = 1.5 * attempt
-                print(f"[警告] 第{attempt}次识别失败，将在{wait:.1f}s后重试：{msg}", flush=True)
+                print(f"[警告] {img_path.name} 第{attempt}次识别失败，将在{wait:.1f}s后重试：{msg}", flush=True)
                 time.sleep(wait)
                 continue
             raise
 
 
 # ---------- 合并与输出 ----------
+
 def normalize_page_schema(page: Any) -> dict:
     """
-    把模型输出强行归一化为：
+    归一化为：
     {
       "sections": [ { "section_index": int|null, "section_title": str|null, "questions":[{...}] } ],
       "errors": [...],
@@ -221,7 +222,6 @@ def normalize_page_schema(page: Any) -> dict:
         if isinstance(qs, dict):
             qs = [qs]
         elif isinstance(qs, str):
-            # 极端兜底：把整段当成一个“未知题号”的题
             qs = [{
                 "question_number": None,
                 "raw_text": qs,
@@ -276,6 +276,7 @@ def normalize_page_schema(page: Any) -> dict:
 
     return page
 
+
 def infer_section_if_missing(
     page: dict,
     last_section: Optional[Tuple[Optional[int], Optional[str]]]
@@ -299,7 +300,6 @@ def infer_section_if_missing(
             sec["_meta"] = sec.get("_meta", {})
             sec["_meta"]["section_inferred"] = True
 
-    # 更新 last_section：取本页最后一个“可识别”section 作为后续继承依据
     new_last = last_section
     for sec in sections:
         idx = sec.get("section_index")
@@ -331,7 +331,6 @@ def flatten_questions(chapter_name: str, pages: List[dict]) -> List[dict]:
 
             for q in sec.get("questions", []):
                 qno = q.get("question_number")
-                base_uid = None
                 if qno is None:
                     base_uid = f"P{page_no}-UNK"
                 else:
@@ -365,7 +364,56 @@ def flatten_questions(chapter_name: str, pages: List[dict]) -> List[dict]:
     return flat
 
 
-def main(chapter_dir: str):
+# ---------- 并发识别 ----------
+
+def _worker_call_vision(img_path: Path, page_no: int, max_retries: int) -> Tuple[int, str, dict]:
+    """
+    每个线程一个 Ark client（更稳，避免共享 client 的线程安全问题）。
+    返回：(page_no, image_name, page_json)
+    """
+    client = Ark(base_url=BASE_URL, api_key=API_KEY)
+    page = call_vision_page(client, img_path, max_retries=max_retries)
+    return page_no, img_path.name, page
+
+
+def recognize_pages_concurrent(
+    imgs: List[Path],
+    max_workers: int = 5,
+    max_retries: int = 3,
+) -> Dict[str, dict]:
+    """
+    并发识别所有图片。返回 dict：{image_name: page_json}
+    """
+    max_workers = max(1, min(int(max_workers), len(imgs)))
+    results: Dict[str, dict] = {}
+
+    tasks: List[Tuple[int, Path]] = []
+    for img in imgs:
+        page_no = extract_page_no_from_name(img.name)
+        tasks.append((page_no, img))
+
+    print(f"[阶段] 2/5 并发识别中... workers={max_workers}，任务数={len(tasks)}", flush=True)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_map = {
+            ex.submit(_worker_call_vision, img, page_no, max_retries): (page_no, img)
+            for (page_no, img) in tasks
+        }
+
+        for fut in tqdm(as_completed(future_map), total=len(future_map), desc="识别页(并发)", ncols=90):
+            page_no, img = future_map[fut]
+            try:
+                got_page_no, img_name, page = fut.result()
+                results[img_name] = page
+            except Exception as e:
+                raise RuntimeError(f"识别失败：page_no={page_no} file={img.name} err={e}") from e
+
+    return results
+
+
+# ---------- 主流程 ----------
+
+def main(chapter_dir: str, workers: int = 5, max_retries: int = 3):
     if not API_KEY or not VISION_MODEL:
         raise RuntimeError("缺少环境变量：ARK_API_KEY 或 ARK_VISION_MODEL（请检查 .env）")
 
@@ -374,7 +422,8 @@ def main(chapter_dir: str):
         raise FileNotFoundError(f"章节目录不存在：{chapter_path.resolve()}")
 
     chapter_name = chapter_path.name
-    # 先扫描图片并检查页码格式
+
+    # 扫描图片并检查页码格式
     imgs_raw = []
     for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp"):
         imgs_raw.extend(chapter_path.glob(ext))
@@ -399,43 +448,39 @@ def main(chapter_dir: str):
         raise RuntimeError(f"发现页码格式异常，已写入：{err_path.resolve()}（请修正文件名后重跑）")
 
     # 页码合格后按页码排序
-    imgs = [p for _, p in sorted(ok, key=lambda x: x[0])]
-
+    imgs = [p for _, p in sorted(ok, key=lambda x: (x[0], x[1].name))]
 
     out_dir = Path("out") / chapter_name
     out_dir.mkdir(parents=True, exist_ok=True)
     out_json_path = out_dir / f"{chapter_name}.json"
 
-    client = Ark(base_url=BASE_URL, api_key=API_KEY)
+    print(f"[阶段] 1/5 开始识别章节：{chapter_name}，页数={len(imgs)}", flush=True)
 
+    # 并发识别：得到每张图的 page 输出
+    pages_by_image = recognize_pages_concurrent(imgs, max_workers=workers, max_retries=max_retries)
+
+    # 按页码顺序做归一化、挂 meta、跨页继承
     pages: List[dict] = []
     last_section: Optional[Tuple[Optional[int], Optional[str]]] = None
 
-    print(f"[阶段] 1/5 开始识别章节：{chapter_name}，页数={len(imgs)}", flush=True)
+    print("[阶段] 3/5 归一化/跨页继承/组装 pages...", flush=True)
 
-    for idx, img in enumerate(tqdm(imgs, desc="识别页"), start=1):
+    for img in imgs:
         page_no = extract_page_no_from_name(img.name)
+        page = pages_by_image.get(img.name)
+        if page is None:
+            raise RuntimeError(f"缺少识别结果：{img.name}")
 
-        print(f"[阶段] 2/5 识别第{idx}页（page_no={page_no}，文件={img.name}）...", flush=True)
-        page = call_vision_page(client, img)
-        
-        # ✅ 新增：先归一化，防止 sections 里混入 str 导致 .get() 崩溃
         page = normalize_page_schema(page)
-        # 挂上元信息
-        page["_meta"] = {
-            "page_no": page_no,
-            "image": img.name,
-        }
 
-        # 跨页继承大题信息（仅在“本页唯一section且缺大题信息”时触发）
+        page["_meta"] = {"page_no": page_no, "image": img.name}
+
         page, last_section = infer_section_if_missing(page, last_section)
-
         pages.append(page)
 
-    print("[阶段] 3/5 拉平题目并生成 uid...", flush=True)
+    print("[阶段] 4/5 拉平题目并生成 uid...", flush=True)
     flat_questions = flatten_questions(chapter_name, pages)
 
-    # 章节级汇总：统计常见异常
     chapter_errors = []
     if any("SPLIT_UNCERTAIN" in (p.get("errors") or []) for p in pages):
         chapter_errors.append("SPLIT_UNCERTAIN")
@@ -452,16 +497,19 @@ def main(chapter_dir: str):
         "errors": chapter_errors,
     }
 
-    print(f"[阶段] 4/5 写入总 JSON：{out_json_path}", flush=True)
+    print(f"[阶段] 5/5 写入总 JSON：{out_json_path}", flush=True)
     out_json_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    print("[阶段] 5/5 完成", flush=True)
+    print("完成", flush=True)
     print(f"输出文件：{out_json_path.resolve()}", flush=True)
 
 
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) < 2:
-        print("用法：python src\\step1_build_chapter_json.py data\\ch01")
-        raise SystemExit(1)
-    main(sys.argv[1])
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("chapter_dir", help="图片文件夹路径，例如 data\\h21")
+    parser.add_argument("--workers", type=int, default=5, help="并发数（建议 3~8，默认 5）")
+    parser.add_argument("--retries", type=int, default=3, help="单页最大重试次数（默认 3）")
+    args = parser.parse_args()
+
+    main(args.chapter_dir, workers=args.workers, max_retries=args.retries)
